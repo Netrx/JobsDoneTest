@@ -53,10 +53,16 @@ function setCustomRange(from, to) {
 function getOrdersInRange(orders) {
   if (!currentRange.from && !currentRange.to) return orders;
   return orders.filter(function(order) {
-    if (!order.endDate) return false;
-    var orderEnd = new Date(order.endDate + 'T23:59:59');
+    if (!order.startDate && !order.endDate) return false;
+    var startISO = order.startDate || order.endDate;
+    var endISO = order.endDate || order.startDate;
+    var orderStart = new Date(startISO + 'T00:00:00');
+    var orderEnd = new Date(endISO + 'T23:59:59');
+
+    // Заказ относится к диапазону, если его период пересекается
+    // с выбранным диапазоном хотя бы одним днём.
     if (currentRange.from && orderEnd < currentRange.from) return false;
-    if (currentRange.to && orderEnd > currentRange.to) return false;
+    if (currentRange.to && orderStart > currentRange.to) return false;
     return true;
   });
 }
@@ -78,55 +84,92 @@ function getWorkDaysInRange() {
   return days;
 }
 
+// ============================================================
+// АНАЛИТИКА
+// hours      — часы смены из календаря (workDays)
+// orderHours — часы, потраченные на заказы (totalHours заказов)
+// income     — доход по завершённым заказам
+// days       — уникальные рабочие дни (со сменой)
+// daily[iso] = { hours, orderHours, income, count }
+// ============================================================
 function analyticsWithRange() {
   var months = [];
   for (var i = 0; i < 12; i++) {
-    months.push({ month: i, hours: 0, income: 0, days: 0, daily: {} });
+    months.push({
+      month: i,
+      hours: 0,
+      orderHours: 0,
+      income: 0,
+      days: 0,
+      daily: {},
+      seenDays: {}
+    });
   }
+
+  // 1. Часы смен и рабочие дни — из календаря
   var workDays = getWorkDaysInRange();
+  for (var iso in workDays) {
+    var d = parseDate(iso);
+    var m = d.getMonth();
+    var h = workDays[iso].hours;
+    months[m].hours += h;
+    if (!months[m].seenDays[iso]) {
+      months[m].seenDays[iso] = true;
+      months[m].days += 1;
+    }
+    if (!months[m].daily[iso]) {
+      months[m].daily[iso] = { hours: 0, orderHours: 0, income: 0, count: 0 };
+    }
+    months[m].daily[iso].hours += h;
+  }
+
+  // 2. Завершённые заказы: сначала распределяем доход и часы по ВСЕМ
+  // рабочим дням заказа, и только потом отбираем дни выбранного периода.
+  // Важно: нельзя считать долю заказа только по workDays текущего фильтра,
+  // иначе при ручном диапазоне весь доход многодневного заказа
+  // искусственно переносится внутрь выбранного периода.
   var completedOrders = state.orders.filter(isCompleted);
-  var filteredOrders = getOrdersInRange(completedOrders);
-  for (var i = 0; i < filteredOrders.length; i++) {
-    var order = filteredOrders[i];
-    var dailyHours = {};
-    var totalOrderHours = 0;
-    var workDayCount = 0;
+
+  for (var i = 0; i < completedOrders.length; i++) {
+    var order = completedOrders[i];
+    var orderIncome = Number(order.income) || 0;
+    var orderTotalHours = Number(order.totalHours) || 0;
+
+    // Все реальные рабочие дни заказа, независимо от текущего фильтра.
+    var allOrderWorkDays = [];
     var start = parseDate(order.startDate);
-    var end = parseDate(order.endDate || todayISO());
+    var end = parseDate(order.endDate || order.startDate);
     for (var d = new Date(start); d <= end; d = addDays(d, 1)) {
       var iso = toISODate(d);
-      if (order.status === "in_progress" && iso > todayISO()) continue;
-      // ИСПОЛЬЗУЕМ НОВУЮ ФУНКЦИЮ ДЛЯ РАСЧЁТА ЧАСОВ
-      var hours = getOrderHoursForDate(order, iso);
-      if (hours > 0 && workDays[iso]) {
-        dailyHours[iso] = hours;
-        totalOrderHours += hours;
-        workDayCount++;
+      var wd = state.workDays && state.workDays[iso];
+      if (wd && wd.start && wd.end && getWorkedHoursForDate(iso) > 0) {
+        allOrderWorkDays.push(iso);
       }
     }
-    if (totalOrderHours <= 0 || workDayCount === 0) continue;
-    var orderIncome = Number(order.income) || 0;
-    var incomePerWorkDay = orderIncome / workDayCount;
-    for (var dayIso in dailyHours) {
-      var dDate = parseDate(dayIso);
-      var m = dDate.getMonth();
-      months[m].hours += dailyHours[dayIso];
-      months[m].income += incomePerWorkDay;
-      months[m].days += 1;
-      if (!months[m].daily[dayIso]) {
-        months[m].daily[dayIso] = { hours: 0, income: 0, count: 0 };
+    if (allOrderWorkDays.length === 0) continue;
+
+    // Доля дня всегда считается от полной длительности заказа.
+    var hoursPerDay = orderTotalHours / allOrderWorkDays.length;
+    var incomePerDay = orderIncome / allOrderWorkDays.length;
+
+    for (var j = 0; j < allOrderWorkDays.length; j++) {
+      var iso = allOrderWorkDays[j];
+
+      // В отображение попадают только дни текущего диапазона.
+      if (!workDays[iso]) continue;
+
+      var m = parseDate(iso).getMonth();
+      if (!months[m].daily[iso]) {
+        months[m].daily[iso] = { hours: 0, orderHours: 0, income: 0, count: 0 };
       }
-      months[m].daily[dayIso].hours += dailyHours[dayIso];
-      months[m].daily[dayIso].income += incomePerWorkDay;
-      months[m].daily[dayIso].count += 1;
+      months[m].daily[iso].orderHours += hoursPerDay;
+      months[m].daily[iso].income += incomePerDay;
+      months[m].daily[iso].count += 1;
+      months[m].orderHours += hoursPerDay;
+      months[m].income += incomePerDay;
     }
   }
-  var allWorkDays = getWorkDaysInRange();
-  for (var key in allWorkDays) {
-    var dDate = allWorkDays[key].date;
-    var m = dDate.getMonth();
-    months[m].days = Math.max(months[m].days || 0, 1);
-  }
+
   return months;
 }
 
@@ -169,22 +212,27 @@ function fillYearSelects() {
 
 function renderDashboard() {
   var data = analyticsWithRange();
-  var totalHours = 0;
+  var totalHours = 0;       // часы смен (календарь)
+  var totalOrderHours = 0;  // часы на заказах
   var totalIncome = 0;
   var maxIncome = 0;
   for (var i = 0; i < data.length; i++) {
     totalHours += data[i].hours;
+    totalOrderHours += data[i].orderHours;
     totalIncome += data[i].income;
     if (data[i].income > maxIncome) maxIncome = data[i].income;
   }
+
   var workDaysInRange = getWorkDaysInRange();
   var totalDays = Object.keys(workDaysInRange).length;
-  var completedCount = 0;
+
   var allOrders = state.orders.filter(isCompleted);
   var filteredOrders = getOrdersInRange(allOrders);
-  completedCount = filteredOrders.length;
+  var completedCount = filteredOrders.length;
+
   var heroValue = document.querySelector(".hero-value");
   if (heroValue) heroValue.textContent = money(totalIncome);
+
   var rangeLabel = "Все время";
   if (currentRange.type === 'today') rangeLabel = "Сегодня";
   else if (currentRange.type === 'week') rangeLabel = "Неделя";
@@ -194,22 +242,32 @@ function renderDashboard() {
     var toStr = currentRange.to ? currentRange.to.toLocaleDateString("ru-RU") : "…";
     rangeLabel = fromStr + " — " + toStr;
   }
+
   var heroMeta = document.querySelector(".hero-meta");
-  if (heroMeta) heroMeta.textContent = completedCount + " завершённых заказов · " + formatHoursMinutes(totalHours) + " · " + rangeLabel;
+  if (heroMeta) {
+    heroMeta.textContent = completedCount + " завершённых заказов · " +
+      formatHoursMinutes(totalHours) + " смен · " +
+      formatHoursMinutes(totalOrderHours) + " на заказах · " + rangeLabel;
+  }
+
+  // KPI: Часы смен | Часы на заказах | Доход/час | Доход/день | Дней
   var kpis = document.querySelectorAll(".kpi strong");
   if (kpis.length >= 4) {
     kpis[0].textContent = formatHoursMinutes(totalHours);
-    kpis[1].textContent = money(totalHours ? totalIncome / totalHours : 0);
-    kpis[2].textContent = money(totalDays ? totalIncome / totalDays : 0);
+    kpis[1].textContent = formatHoursMinutes(totalOrderHours);
+    kpis[2].textContent = money(totalHours ? totalIncome / totalHours : 0);
     kpis[3].textContent = totalDays;
   }
+
   var list = document.getElementById("monthsList");
   if (!list) return;
-  if (totalHours === 0 && totalIncome === 0) {
+  if (totalHours === 0 && totalIncome === 0 && totalOrderHours === 0) {
     list.innerHTML = '<div class="empty">Нет данных</div>';
     return;
   }
+
   var html = "";
+
   if (currentRange.type === 'today' || currentRange.type === 'week' || currentRange.type === 'month' || currentRange.type === 'custom') {
     var dailyData = [];
     for (var m = 0; m < 12; m++) {
@@ -217,18 +275,21 @@ function renderDashboard() {
         dailyData.push({
           date: dateKey,
           hours: data[m].daily[dateKey].hours,
+          orderHours: data[m].daily[dateKey].orderHours,
           income: data[m].daily[dateKey].income,
           count: data[m].daily[dateKey].count
         });
       }
     }
     dailyData.sort(function(a, b) { return a.date.localeCompare(b.date); });
+
     for (var i = 0; i < dailyData.length; i++) {
       var d = dailyData[i];
       var dateObj = parseDate(d.date);
       var dateStr = dateObj.toLocaleDateString("ru-RU", { day: "2-digit", month: "2-digit" });
       var pct = maxIncome > 0 ? (d.income / maxIncome) * 100 : 0;
-      var perDay = d.hours > 0 ? d.income / d.hours : 0;
+      var perHour = d.hours > 0 ? d.income / d.hours : 0;
+
       html += '<div class="month-row">';
       html += '<div class="month-name">' + dateStr + '</div>';
       html += '<div class="month-income-cell">';
@@ -236,8 +297,8 @@ function renderDashboard() {
       html += '<div class="month-bar-wrapper"><div class="month-bar"><span style="width:' + pct + '%"></span></div></div>';
       html += '</div>';
       html += '<div class="month-stats">';
-      html += '<strong>' + formatHoursMinutes(d.hours) + '</strong>';
-      html += '<span>' + money(perDay) + '/ч · ' + d.count + ' зак.</span>';
+      html += '<strong>' + formatHoursMinutes(d.hours) + ' смена</strong>';
+      html += '<span>' + formatHoursMinutes(d.orderHours) + ' заказы · ' + money(perHour) + '/ч · ' + d.count + ' зак.</span>';
       html += '</div>';
       html += '</div>';
     }
@@ -246,6 +307,8 @@ function renderDashboard() {
       var m = data[i];
       var pct = maxIncome > 0 ? (m.income / maxIncome) * 100 : 0;
       var dayAvg = m.days > 0 ? m.income / m.days : 0;
+      var hourAvg = m.hours > 0 ? m.income / m.hours : 0;
+
       html += '<div class="month-row">';
       html += '<div class="month-name">' + MONTHS[m.month] + '</div>';
       html += '<div class="month-income-cell">';
@@ -253,12 +316,13 @@ function renderDashboard() {
       html += '<div class="month-bar-wrapper"><div class="month-bar"><span style="width:' + pct + '%"></span></div></div>';
       html += '</div>';
       html += '<div class="month-stats">';
-      html += '<strong>' + formatHoursMinutes(m.hours) + '</strong>';
-      html += '<span>' + money(dayAvg) + ' / день · ' + m.days + ' дн.</span>';
+      html += '<strong>' + formatHoursMinutes(m.hours) + ' смена</strong>';
+      html += '<span>' + formatHoursMinutes(m.orderHours) + ' заказы · ' + money(hourAvg) + '/ч · ' + m.days + ' дн.</span>';
       html += '</div>';
       html += '</div>';
     }
   }
+
   list.innerHTML = html;
 }
 
@@ -272,7 +336,8 @@ function initFilters() {
       var customRange = document.getElementById('customRange');
       if (range === 'custom') {
         customRange.style.display = 'flex';
-        setRange('custom');
+        // Не пересчитываем аналитику, пока пользователь не нажал «Применить».
+        // Иначе getDefaultRange('custom') временно подставляет текущий момент.
       } else {
         customRange.style.display = 'none';
         setRange(range);
@@ -284,6 +349,10 @@ function initFilters() {
     var to = document.getElementById('dateTo').value;
     if (!from && !to) {
       toast('Выберите даты');
+      return;
+    }
+    if (from && to && from > to) {
+      toast('Дата начала не может быть позже даты окончания');
       return;
     }
     setCustomRange(from, to);
